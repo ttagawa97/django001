@@ -1,5 +1,6 @@
 import csv
 import io
+from datetime import timedelta
 from decimal import Decimal, InvalidOperation
 
 from django.db import transaction
@@ -8,6 +9,9 @@ from django.utils.dateparse import parse_datetime
 from rest_framework.exceptions import ValidationError
 
 from .models import DeviceStatus, LatestValue, ParsedData
+
+
+DEVICE_CLOCK_SKEW_TOLERANCE = timedelta(minutes=15)
 
 
 def parse_json_payload(payload, device):
@@ -105,6 +109,10 @@ def _parse_timestamp(value):
     parsed = parse_datetime(value)
     if parsed is None or timezone.is_naive(parsed):
         raise ValidationError({'timestamp': 'timestamp must be an ISO 8601 datetime with timezone.'})
+    if parsed.utcoffset() != timedelta(hours=9):
+        raise ValidationError({'timestamp': 'timestamp must use the Asia/Tokyo UTC+09:00 offset.'})
+    if parsed > timezone.now() + DEVICE_CLOCK_SKEW_TOLERANCE:
+        raise ValidationError({'timestamp': 'timestamp must not be more than 15 minutes in the future.'})
     return parsed
 
 

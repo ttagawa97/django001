@@ -7,6 +7,7 @@ from binascii import Error as Base64Error
 
 from django.contrib.auth.hashers import check_password, make_password
 from django.db.models import Count, Q
+from django.utils.dateparse import parse_datetime
 from rest_framework.exceptions import APIException, ValidationError
 from rest_framework import mixins, status, viewsets
 from rest_framework.decorators import action
@@ -21,6 +22,7 @@ from .models import (
     Device,
     DeviceStatus,
     PlatformUser,
+    ParsedData,
     RawData,
     Site,
     Status,
@@ -452,12 +454,36 @@ class DeviceViewSet(ScopedModelViewSet):
     @action(detail=True, methods=['get'])
     def graph(self, request, pk=None):
         device = self.get_object()
+        points = ParsedData.objects.filter(device=device, is_valid=True).order_by('device_timestamp', 'id')
+
+        from_value = request.query_params.get('from')
+        to_value = request.query_params.get('to')
+        column_name = request.query_params.get('column_name')
+
+        if from_value:
+            from_datetime = parse_datetime(from_value)
+            if from_datetime is None:
+                raise ValidationError({'from': 'from must be an ISO 8601 datetime.'})
+            points = points.filter(device_timestamp__gte=from_datetime)
+        if to_value:
+            to_datetime = parse_datetime(to_value)
+            if to_datetime is None:
+                raise ValidationError({'to': 'to must be an ISO 8601 datetime.'})
+            points = points.filter(device_timestamp__lte=to_datetime)
+        if column_name:
+            points = points.filter(column_name=column_name)
+
         return Response(
             {
                 'device_id': device.device_id,
-                'period_preset': request.query_params.get('period_preset', '24h'),
-                'series': [],
-                'message': 'Graph data is not implemented in PoC.',
+                'points': list(points.values(
+                    'column_name',
+                    'raw_value',
+                    'display_value',
+                    'device_timestamp',
+                    'server_timestamp',
+                    'is_valid',
+                )),
             }
         )
 

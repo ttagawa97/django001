@@ -176,6 +176,36 @@ class DeviceDataReceiveApiTests(TestCase):
         self.assertEqual(self.device.communication_status.status, 'normal')
         self.assertIsNotNone(self.device.communication_status.last_received_at)
 
+    def test_graph_api_returns_stored_parsed_data(self):
+        self.client.post(
+            '/api/v1/data',
+            {
+                'device_id': 'DEVICE001',
+                'timestamp': '2026-06-12T10:00:00+09:00',
+                'values': {'temp': 20, 'enabled': True},
+            },
+            format='json',
+            HTTP_AUTHORIZATION=self.authorization(),
+        )
+        login_response = self.client.post(
+            '/api/v1/auth/login',
+            {'login_id': 'admin', 'password': 'admin123'},
+            format='json',
+        )
+        self.client.credentials(HTTP_AUTHORIZATION=f"Bearer {login_response.data['token']}")
+
+        response = self.client.get(
+            f'/api/v1/devices/{self.device.pk}/graph',
+            {'column_name': 'temp'},
+        )
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.data['device_id'], 'DEVICE001')
+        self.assertEqual(len(response.data['points']), 1)
+        self.assertEqual(response.data['points'][0]['column_name'], 'temp')
+        self.assertEqual(response.data['points'][0]['raw_value'], 20)
+        self.assertEqual(response.data['points'][0]['display_value'], 30.0)
+
     def test_invalid_data_is_accepted_and_recorded_as_error(self):
         response = self.client.post(
             '/api/v1/data',
@@ -208,6 +238,42 @@ class DeviceDataReceiveApiTests(TestCase):
 
         self.assertEqual(response.status_code, 401)
         self.assertFalse(RawData.objects.exists())
+
+    def test_timestamp_with_non_tokyo_offset_is_recorded_as_invalid(self):
+        response = self.client.post(
+            '/api/v1/data',
+            {
+                'device_id': 'DEVICE001',
+                'timestamp': '2026-06-12T10:00:00+09:20',
+                'values': {'temp': 20},
+            },
+            format='json',
+            HTTP_AUTHORIZATION=self.authorization(),
+        )
+
+        self.assertEqual(response.status_code, 202)
+        raw_data = RawData.objects.get(device=self.device)
+        self.assertTrue(raw_data.is_error)
+        self.assertIn('UTC+09:00', raw_data.error_message)
+        self.assertFalse(ParsedData.objects.exists())
+
+    def test_timestamp_too_far_in_the_future_is_recorded_as_invalid(self):
+        response = self.client.post(
+            '/api/v1/data',
+            {
+                'device_id': 'DEVICE001',
+                'timestamp': '2099-06-12T10:00:00+09:00',
+                'values': {'temp': 20},
+            },
+            format='json',
+            HTTP_AUTHORIZATION=self.authorization(),
+        )
+
+        self.assertEqual(response.status_code, 202)
+        raw_data = RawData.objects.get(device=self.device)
+        self.assertTrue(raw_data.is_error)
+        self.assertIn('15 minutes', raw_data.error_message)
+        self.assertFalse(ParsedData.objects.exists())
 
     def test_csv_data_with_header_is_stored(self):
         self.device.input_type = 'csv'
