@@ -8,7 +8,7 @@ from binascii import Error as Base64Error
 from django.contrib.auth.hashers import check_password, make_password
 from django.db.models import Count, Q
 from django.utils.dateparse import parse_datetime
-from rest_framework.exceptions import APIException, ValidationError
+from rest_framework.exceptions import APIException, MethodNotAllowed, NotFound, ValidationError
 from rest_framework import mixins, status, viewsets
 from rest_framework.decorators import action
 from rest_framework.response import Response
@@ -37,6 +37,7 @@ from .serializers import (
     DeviceLatestSerializer,
     DeviceSerializer,
     LoginSerializer,
+    PasswordResetExecuteSerializer,
     PlatformUserSerializer,
     SiteSerializer,
     ThresholdSerializer,
@@ -227,7 +228,17 @@ class PasswordResetExecuteView(LoggedAPIView):
     permission_classes = []
 
     def post(self, request):
-        return Response({'message': 'Password reset execution is not implemented in PoC.'})
+        serializer = PasswordResetExecuteSerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        user = PlatformUser.objects.filter(
+            login_id=serializer.validated_data['login_id'],
+            status=Status.ACTIVE,
+        ).first()
+        if user is None:
+            raise NotFound('Active user was not found.')
+        user.password_hash = make_password(serializer.validated_data['new_password'])
+        user.save(update_fields=['password_hash', 'updated_at'])
+        return Response({'password_reset': True})
 
 
 class DeviceDataReceiveView(LoggedAPIView):
@@ -334,6 +345,15 @@ class CompanyViewSet(LoggedModelViewSet):
     queryset = Company.objects.all().order_by('id')
     allowed_roles = [UserRole.SYSTEM_ADMIN]
 
+    def retrieve(self, request, *args, **kwargs):
+        raise MethodNotAllowed('GET')
+
+    def partial_update(self, request, *args, **kwargs):
+        raise MethodNotAllowed('PATCH')
+
+    def destroy(self, request, *args, **kwargs):
+        raise MethodNotAllowed('DELETE')
+
     @action(detail=True, methods=['post'])
     def disable(self, request, pk=None):
         company = self.get_object()
@@ -359,9 +379,18 @@ class ScopedModelViewSet(LoggedModelViewSet):
         UserRole.GENERAL_USER,
     ]
     write_roles = WRITE_ROLES
+    query_filter_map = {}
 
     def get_queryset(self):
         return scoped_queryset(super().get_queryset(), self.request.poc_user)
+
+    def filter_queryset(self, queryset):
+        queryset = super().filter_queryset(queryset)
+        for query_name, field_name in self.query_filter_map.items():
+            value = self.request.query_params.get(query_name)
+            if value not in (None, ''):
+                queryset = queryset.filter(**{field_name: value})
+        return queryset
 
     def check_write_permission(self):
         if self.request.poc_user.role not in self.write_roles:
@@ -376,12 +405,13 @@ class ScopedModelViewSet(LoggedModelViewSet):
         return super().update(request, *args, **kwargs)
 
     def partial_update(self, request, *args, **kwargs):
-        self.check_write_permission()
-        return super().partial_update(request, *args, **kwargs)
+        raise MethodNotAllowed('PATCH')
 
     def destroy(self, request, *args, **kwargs):
-        self.check_write_permission()
-        return super().destroy(request, *args, **kwargs)
+        raise MethodNotAllowed('DELETE')
+
+    def retrieve(self, request, *args, **kwargs):
+        raise MethodNotAllowed('GET')
 
 
 class SiteViewSet(ScopedModelViewSet):
@@ -394,6 +424,10 @@ class SiteViewSet(ScopedModelViewSet):
         UserRole.GENERAL_USER,
     ]
     write_roles = {UserRole.SYSTEM_ADMIN, UserRole.COMPANY_ADMIN}
+    query_filter_map = {
+        'company_id': 'company_id',
+        'site_id': 'pk',
+    }
 
     @action(detail=True, methods=['post'])
     def disable(self, request, pk=None):
@@ -417,6 +451,10 @@ class PlatformUserViewSet(ScopedModelViewSet):
     serializer_class = PlatformUserSerializer
     queryset = PlatformUser.objects.select_related('company', 'site').all().order_by('id')
     allowed_roles = [UserRole.SYSTEM_ADMIN, UserRole.COMPANY_ADMIN, UserRole.SITE_ADMIN]
+    query_filter_map = {
+        'company_id': 'company_id',
+        'site_id': 'site_id',
+    }
 
     @action(detail=True, methods=['post'], url_path='reset-password')
     def reset_password(self, request, pk=None):
@@ -439,7 +477,23 @@ class PlatformUserViewSet(ScopedModelViewSet):
 
 class DeviceViewSet(ScopedModelViewSet):
     serializer_class = DeviceSerializer
-    queryset = Device.objects.select_related('company', 'site').prefetch_related('columns', 'latest_values').all().order_by('id')
+    lookup_field = 'device_id'
+    queryset = Device.objects.select_related(
+        'company',
+        'site',
+        'communication_status',
+    ).prefetch_related(
+        'columns',
+        'latest_values',
+        'thresholds',
+    ).all().order_by('id')
+    query_filter_map = {
+        'company_id': 'company_id',
+        'site_id': 'site_id',
+    }
+
+    def retrieve(self, request, *args, **kwargs):
+        return LoggedModelViewSet.retrieve(self, request, *args, **kwargs)
 
     @action(detail=False, methods=['get'])
     def latest(self, request):
@@ -447,12 +501,12 @@ class DeviceViewSet(ScopedModelViewSet):
         return Response(DeviceLatestSerializer(queryset, many=True).data)
 
     @action(detail=True, methods=['get'])
-    def columns(self, request, pk=None):
+    def columns(self, request, device_id=None):
         device = self.get_object()
         return Response(DeviceColumnSerializer(device.columns.all(), many=True).data)
 
     @action(detail=True, methods=['get'])
-    def graph(self, request, pk=None):
+    def graph(self, request, device_id=None):
         device = self.get_object()
         points = ParsedData.objects.filter(device=device, is_valid=True).order_by('device_timestamp', 'id')
 
@@ -488,7 +542,7 @@ class DeviceViewSet(ScopedModelViewSet):
         )
 
     @action(detail=True, methods=['post'])
-    def disable(self, request, pk=None):
+    def disable(self, request, device_id=None):
         self.check_write_permission()
         device = self.get_object()
         device.status = Status.INACTIVE
@@ -508,7 +562,22 @@ class DeviceViewSet(ScopedModelViewSet):
 class ThresholdViewSet(ScopedModelViewSet):
     serializer_class = ThresholdSerializer
     queryset = Threshold.objects.select_related('company', 'site', 'device').all().order_by('id')
-    allowed_roles = [UserRole.SYSTEM_ADMIN, UserRole.COMPANY_ADMIN, UserRole.SITE_ADMIN]
+    allowed_roles = [
+        UserRole.SYSTEM_ADMIN,
+        UserRole.COMPANY_ADMIN,
+        UserRole.SITE_ADMIN,
+        UserRole.GENERAL_USER,
+    ]
+    query_filter_map = {
+        'company_id': 'company_id',
+        'site_id': 'site_id',
+        'device_id': 'device__device_id',
+        'column_name': 'column_name',
+    }
+
+    def destroy(self, request, *args, **kwargs):
+        self.check_write_permission()
+        return LoggedModelViewSet.destroy(self, request, *args, **kwargs)
 
     def perform_create(self, serializer):
         threshold = serializer.save()
@@ -531,11 +600,18 @@ class AuditLogViewSet(mixins.ListModelMixin, LoggedGenericViewSet):
     def get_queryset(self):
         user = self.request.poc_user
         queryset = super().get_queryset()
-        if user.role == UserRole.SYSTEM_ADMIN:
-            return queryset
         if user.role == UserRole.COMPANY_ADMIN:
-            return queryset.filter(company=user.company)
-        return queryset.filter(company=user.company, site=user.site)
+            queryset = queryset.filter(company=user.company)
+        elif user.role != UserRole.SYSTEM_ADMIN:
+            queryset = queryset.filter(company=user.company, site=user.site)
+
+        company_id = self.request.query_params.get('company_id')
+        site_id = self.request.query_params.get('site_id')
+        if company_id:
+            queryset = queryset.filter(company_id=company_id)
+        if site_id:
+            queryset = queryset.filter(site_id=site_id)
+        return queryset
 
 
 class DashboardSummaryView(LoggedAPIView):
