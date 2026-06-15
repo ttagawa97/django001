@@ -1,14 +1,25 @@
+import csv
+import io
 import logging
 import json
 import secrets
 import time
 from base64 import b64decode
 from binascii import Error as Base64Error
+from urllib.parse import quote
 
 from django.contrib.auth.hashers import check_password, make_password
-from django.db.models import Count, Q
+from django.db.models import Case, Count, IntegerField, Q, Value, When
+from django.http import HttpResponse
+from django.utils import timezone
 from django.utils.dateparse import parse_datetime
-from rest_framework.exceptions import APIException, MethodNotAllowed, NotFound, ValidationError
+from rest_framework.exceptions import (
+    APIException,
+    MethodNotAllowed,
+    NotFound,
+    PermissionDenied,
+    ValidationError,
+)
 from rest_framework import mixins, status, viewsets
 from rest_framework.decorators import action
 from rest_framework.response import Response
@@ -29,6 +40,7 @@ from .models import (
     Threshold,
     UserRole,
 )
+from .renderers import PoCJSONRenderer
 from .serializers import (
     AuditLogSerializer,
     CompanySerializer,
@@ -492,6 +504,11 @@ class DeviceViewSet(ScopedModelViewSet):
         'site_id': 'site_id',
     }
 
+    def perform_content_negotiation(self, request, force=False):
+        if getattr(self, 'action', None) == 'graph_csv':
+            return PoCJSONRenderer(), 'application/json'
+        return super().perform_content_negotiation(request, force)
+
     def retrieve(self, request, *args, **kwargs):
         return LoggedModelViewSet.retrieve(self, request, *args, **kwargs)
 
@@ -540,6 +557,93 @@ class DeviceViewSet(ScopedModelViewSet):
                 )),
             }
         )
+
+    @action(detail=True, methods=['get'], url_path='graph/csv', url_name='graph-csv')
+    def graph_csv(self, request, device_id=None):
+        device = Device.objects.prefetch_related('columns').filter(
+            device_id=device_id
+        ).first()
+        if device is None:
+            raise NotFound('Device was not found.')
+        if not scoped_queryset(
+            Device.objects.filter(pk=device.pk),
+            request.poc_user,
+        ).exists():
+            raise PermissionDenied('You do not have permission to access this device.')
+
+        from_datetime, to_datetime = self._required_graph_range(request)
+        column_order = Case(
+            *[
+                When(column_name=column.column_name, then=Value(column.display_order))
+                for column in device.columns.all()
+            ],
+            default=Value(2147483647),
+            output_field=IntegerField(),
+        )
+        points = ParsedData.objects.filter(
+            device=device,
+            device_timestamp__gte=from_datetime,
+            device_timestamp__lte=to_datetime,
+        ).order_by('device_timestamp', column_order, 'id')
+
+        columns = {column.column_name: column for column in device.columns.all()}
+        output = io.StringIO(newline='')
+        writer = csv.writer(output, lineterminator='\r\n')
+        writer.writerow(
+            [
+                'device_timestamp',
+                'column_name',
+                'display_name',
+                'display_value',
+                'raw_value',
+                'unit',
+                'server_timestamp',
+            ]
+        )
+        for point in points:
+            column = columns.get(point.column_name)
+            writer.writerow(
+                [
+                    point.device_timestamp.isoformat(),
+                    point.column_name,
+                    column.display_name if column else point.column_name,
+                    point.display_value,
+                    point.raw_value,
+                    column.unit if column else '',
+                    point.server_timestamp.isoformat(),
+                ]
+            )
+
+        start_date = timezone.localtime(from_datetime).date().isoformat()
+        end_date = timezone.localtime(to_datetime).date().isoformat()
+        filename = f'{device.device_id}_{start_date}_{end_date}.csv'
+        response = HttpResponse(
+            '\ufeff' + output.getvalue(),
+            content_type='text/csv; charset=utf-8',
+        )
+        response['Content-Disposition'] = (
+            "attachment; filename*=UTF-8''" + quote(filename)
+        )
+        return response
+
+    def _required_graph_range(self, request):
+        values = {}
+        errors = {}
+        for field_name in ('from', 'to'):
+            raw_value = request.query_params.get(field_name)
+            if not raw_value:
+                errors[field_name] = f'{field_name} is required.'
+                continue
+            parsed = parse_datetime(raw_value)
+            if parsed is None or timezone.is_naive(parsed):
+                errors[field_name] = f'{field_name} must be an ISO 8601 datetime with timezone.'
+                continue
+            values[field_name] = parsed
+        if errors:
+            raise ValidationError(errors)
+        if values['from'] > values['to']:
+            raise ValidationError({'from': 'from must be less than or equal to to.'})
+        return values['from'], values['to']
 
     @action(detail=True, methods=['post'])
     def disable(self, request, device_id=None):

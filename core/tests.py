@@ -1,5 +1,9 @@
 import base64
+import csv
+import io
 import json
+from datetime import datetime
+from zoneinfo import ZoneInfo
 
 from django.contrib.auth.hashers import check_password, make_password
 from django.test import TestCase
@@ -544,5 +548,143 @@ class ApiSpecificationContractTests(TestCase):
 
         self.assertEqual(patch_response.status_code, 405)
         self.assertEqual(delete_response.status_code, 405)
+
+    def test_graph_csv_matches_specification(self):
+        humidity_column = DeviceColumn.objects.create(
+            device=self.device_a,
+            column_name='humidity',
+            display_name='Humidity',
+            data_type='number',
+            unit='%',
+            display_order=2,
+        )
+        temp_column = self.device_a.columns.get(column_name='temp')
+        temp_column.display_order = 1
+        temp_column.save(update_fields=['display_order'])
+        measured_at = datetime(2026, 6, 15, 10, 0, tzinfo=ZoneInfo('Asia/Tokyo'))
+        raw_data = RawData.objects.create(
+            company=self.company_a,
+            site=self.site_a,
+            device=self.device_a,
+            content_type='application/json',
+            payload={},
+        )
+        ParsedData.objects.create(
+            company=self.company_a,
+            site=self.site_a,
+            device=self.device_a,
+            raw_data=raw_data,
+            device_timestamp=measured_at,
+            column_name=humidity_column.column_name,
+            raw_value=60,
+            display_value=60,
+            is_valid=False,
+            error_message='invalid sample',
+        )
+        ParsedData.objects.create(
+            company=self.company_a,
+            site=self.site_a,
+            device=self.device_a,
+            raw_data=raw_data,
+            device_timestamp=measured_at,
+            column_name=temp_column.column_name,
+            raw_value=20,
+            display_value=20,
+        )
+        self.authenticate(self.general_user)
+
+        response = self.client.get(
+            '/api/v1/devices/CONTRACT-A/graph/csv',
+            {
+                'from': '2026-06-15T00:00:00+09:00',
+                'to': '2026-06-15T23:59:59.999+09:00',
+            },
+            HTTP_ACCEPT='text/csv',
+        )
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response['Content-Type'], 'text/csv; charset=utf-8')
+        self.assertEqual(
+            response['Content-Disposition'],
+            "attachment; filename*=UTF-8''CONTRACT-A_2026-06-15_2026-06-15.csv",
+        )
+        self.assertEqual(response['Access-Control-Expose-Headers'], 'Content-Disposition')
+        self.assertTrue(response.content.startswith(b'\xef\xbb\xbf'))
+        rows = list(csv.reader(io.StringIO(response.content.decode('utf-8-sig'))))
+        self.assertEqual(
+            rows[0],
+            [
+                'device_timestamp',
+                'column_name',
+                'display_name',
+                'display_value',
+                'raw_value',
+                'unit',
+                'server_timestamp',
+            ],
+        )
+        self.assertEqual([row[1] for row in rows[1:]], ['temp', 'humidity'])
+        self.assertEqual(rows[1][2:6], ['Temperature', '20', '20', 'C'])
+        self.assertEqual(rows[2][2:6], ['Humidity', '60', '60', '%'])
+
+    def test_graph_csv_empty_range_returns_header_only(self):
+        self.authenticate(self.general_user)
+
+        response = self.client.get(
+            '/api/v1/devices/CONTRACT-A/graph/csv',
+            {
+                'from': '2026-06-15T00:00:00+09:00',
+                'to': '2026-06-15T23:59:59.999+09:00',
+            },
+        )
+
+        rows = list(csv.reader(io.StringIO(response.content.decode('utf-8-sig'))))
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(len(rows), 1)
+
+    def test_graph_csv_validates_required_range_and_order(self):
+        self.authenticate(self.general_user)
+
+        missing_response = self.client.get(
+            '/api/v1/devices/CONTRACT-A/graph/csv',
+            {'from': '2026-06-15T00:00:00+09:00'},
+        )
+        invalid_response = self.client.get(
+            '/api/v1/devices/CONTRACT-A/graph/csv',
+            {
+                'from': 'not-a-datetime',
+                'to': '2026-06-15T23:59:59+09:00',
+            },
+        )
+        reversed_response = self.client.get(
+            '/api/v1/devices/CONTRACT-A/graph/csv',
+            {
+                'from': '2026-06-16T00:00:00+09:00',
+                'to': '2026-06-15T23:59:59+09:00',
+            },
+        )
+
+        self.assertEqual(missing_response.status_code, 400)
+        self.assertEqual(invalid_response.status_code, 400)
+        self.assertEqual(reversed_response.status_code, 400)
+
+    def test_graph_csv_distinguishes_forbidden_and_missing_devices(self):
+        self.authenticate(self.general_user)
+        params = {
+            'from': '2026-06-15T00:00:00+09:00',
+            'to': '2026-06-15T23:59:59+09:00',
+        }
+
+        forbidden_response = self.client.get(
+            '/api/v1/devices/CONTRACT-B/graph/csv',
+            params,
+        )
+        missing_response = self.client.get(
+            '/api/v1/devices/DOES-NOT-EXIST/graph/csv',
+            params,
+        )
+
+        self.assertEqual(forbidden_response.status_code, 403)
+        self.assertEqual(missing_response.status_code, 404)
 
 # Create your tests here.

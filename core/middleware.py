@@ -12,4 +12,5 @@ class PoCCorsMiddleware:
         response['Access-Control-Allow-Origin'] = '*'
         response['Access-Control-Allow-Methods'] = 'GET,POST,PUT,PATCH,DELETE,OPTIONS'
         response['Access-Control-Allow-Headers'] = 'Content-Type,Authorization'
+        response['Access-Control-Expose-Headers'] = 'Content-Disposition'
         return response
